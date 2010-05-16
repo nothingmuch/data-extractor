@@ -1,7 +1,7 @@
 package Data::Extractor;
 use Moose;
 
-use Moose::Autobox;
+#use Moose::Autobox; # used lexically below
 use Try::Tiny;
 use JSON;
 use Carp;
@@ -28,9 +28,9 @@ has _cache => (
 
 
 sub extract {
-    my ( $self, $data, $path ) = @_;
+    my ( $self, $data, @paths ) = @_;
 
-    $self->traverse($data, $self->parse_path($path) );
+    $self->traverse($data, map { $self->parse_path($_) } @paths );
 }
 
 sub traverse {
@@ -59,16 +59,24 @@ sub traverse {
             # foo.bar, 'bar' is either a key or a method (autoboxed or otherwise)
             if ( ref($data) eq 'HASH' ) {
                 # keys on hashes never fail, even when fatal
-                return $self->traverse(
-                    ( exists $data->{$$next}
-                        ? $data->{$$next}
-                        : try { scalar $data->$$next } catch { $data->{$$next} }
-                    ),
-                    @tail
-                );
+
+                if ( exists $data->{$$next} ) {
+                    return $self->traverse( $data->{$$next}, @tail );
+                } else {
+                    return $self->traverse(
+                        $data,
+                        $self->_compile_nonfatal_method(
+                            method => $$next,
+                            catch => sub {
+                                return $_[0]{$$next};
+                            },
+                        ),
+                        @tail,
+                    );
+                }
             } else {
                 # handles objects, classes and autoboxed method calls on anything
-                return $self->traverse($data, $self->_compile_method($$next), @tail);
+                return $self->traverse($data, $self->_compile_method_wrapper( method => $$next ), @tail);
             }
         }
     }
@@ -76,25 +84,52 @@ sub traverse {
     croak "Not sure what kind of operation $next is";
 }
 
-sub _compile_method {
-    my ( $self, $method, @args ) = @_;
+use Moose::Autobox;
 
-    if ( $self->unknown_method_is_fatal ) {
-        sub {
-            my $inv = shift;
-            $inv->$method(@args);
-        };
-    } else {
-        sub {
-            my $inv = shift;
-            try {
-                $inv->$method(@args);
-            } catch {
-                die $_ if ref($_);
-                die $_ unless /^(?:Can't locate object method "\Q$method\E" via package|Can't call method "\Q$method\E" on)/;
+sub _compile_method {
+    my ( $self, %args ) = @_;
+
+    my $method = $args{method};
+    my @args = @{ $args{args} || [] };
+
+    return sub {
+        $_[0]->$method(@args);
+    };
+}
+
+sub _compile_nonfatal_method {
+    my ( $self, %args ) = @_;
+
+    my $catch  = $args{catch};
+    my $method = $args{method};
+
+    my $body = $self->_compile_method(%args);
+
+    return sub {
+        my $inv = shift;
+
+        try {
+            return $inv->$body;
+        } catch {
+            die $_ if ref($_);
+            die $_ unless /^(?:Can't locate object method "\Q$method\E" via package|Can't call method "\Q$method\E" on)/;
+
+            if ( $catch ) {
+                return $inv->$catch;
+            } else {
                 return;
             }
-        }
+        };
+    }
+}
+
+sub _compile_method_wrapper {
+    my ( $self, @args ) = @_;
+
+    if ( $self->unknown_method_is_fatal ) {
+        return $self->_compile_method(@args);
+    } else {
+        return $self->_compile_nonfatal_method(@args);
     }
 }
 
@@ -112,6 +147,8 @@ my $close_subscript = qr{\]};
 
 sub parse_path {
     my ( $self, $path ) = @_;
+
+    return $path if ref $path;
 
     if ( $self->cache ) {
         if ( my $res = $self->_cache->{$path} ) {
@@ -152,7 +189,7 @@ sub _parse_path {
                     }
                 }
 
-                push @ret, $self->_compile_method($name, @args);
+                push @ret, $self->_compile_method_wrapper( method => $name, args => \@args );
             } else {
                 push @ret, \$name;
                 pos($path) = $p;
