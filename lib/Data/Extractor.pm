@@ -1,10 +1,18 @@
 package Data::Extractor;
 use Moose;
 
+use Moose::Autobox;
+use Try::Tiny;
 use JSON;
 use Carp;
 
 use namespace::autoclean;
+
+has unknown_method_is_fatal => (
+    isa => "Bool",
+    is  => "ro",
+    default => 1,
+);
 
 has cache => (
     isa => "Bool",
@@ -26,49 +34,75 @@ sub extract {
 }
 
 sub traverse {
-    my ( $self, $data, $next, @tail ) = @_;
+    my ( $self, $data, @ops ) = @_;
 
-    use Devel::PartialDump qw(warn);
+    return $data unless @ops;
 
-    return $data unless defined $next;
+    my ( $next, @tail ) = @ops;
 
-    if ( ref $next eq 'ARRAY' ) {
-        return $self->traverse([ map { $self->traverse($data, $_) } @$next ], @tail);
-    } elsif ( ref $next eq 'CODE' ) {
-        $self->traverse( $data->$next($self), @tail );
-    } elsif ( blessed($data) ) {
-        if ( $data->can($next) ) {
-            $self->traverse( $data->$next, @tail );
-        } else {
-            return;
-        }
-    } elsif ( ref($data) eq 'HASH' ) {
-        if ( exists $data->{$next} ) {
+    if ( not ref $next ) {
+        # simple subscript, ["foo"]
+        if ( ref $data eq 'ARRAY' ) {
+            return $self->traverse( $data->[$next], @tail );
+        } elsif ( ref $data eq 'HASH' ) {
             return $self->traverse( $data->{$next}, @tail );
         } else {
-            return $self->traverse($data, $self->_compile_method($next), @tail);
-        }
-    } elsif ( ref($data) eq 'ARRAY' ) {
-        if ( Scalar::Util::looks_like_number($next) ) {
-            return $self->traverse( $data->[$next], @tail );
-        } else {
-            return $self->traverse($data, $self->_compile_method($next), @tail);
+            croak "Simple subscripts only apply to hashes and arrays";
         }
     } else {
-        $self->traverse($data, $self->_compile_method($next), @tail);
+        if ( ref $next eq 'ARRAY' ) {
+            return $self->traverse([ map { scalar $self->traverse($data, $_) } @$next ], @tail);
+        } elsif ( ref $next eq 'CODE' ) {
+            return $self->traverse( scalar($data->$next($self)), @tail );
+        } elsif ( ref $next eq 'SCALAR' ) {
+            # DWIM mode:
+            # foo.bar, 'bar' is either a key or a method (autoboxed or otherwise)
+            if ( ref($data) eq 'HASH' ) {
+                # keys on hashes never fail, even when fatal
+                return $self->traverse(
+                    ( exists $data->{$$next}
+                        ? $data->{$$next}
+                        : try { scalar $data->$$next } catch { $data->{$$next} }
+                    ),
+                    @tail
+                );
+            } else {
+                # handles objects, classes and autoboxed method calls on anything
+                return $self->traverse($data, $self->_compile_method($$next), @tail);
+            }
+        }
     }
+
+    croak "Not sure what kind of operation $next is";
 }
 
 sub _compile_method {
     my ( $self, $method, @args ) = @_;
-    sub {
-        use Moose::Autobox;
-        my $inv = shift;
-        $inv->$method(@args);
-    };
+
+    if ( $self->unknown_method_is_fatal ) {
+        sub {
+            my $inv = shift;
+            $inv->$method(@args);
+        };
+    } else {
+        sub {
+            my $inv = shift;
+            try {
+                $inv->$method(@args);
+            } catch {
+                die $_ if ref($_);
+                die $_ unless /^(?:Can't locate object method "\Q$method\E" via package|Can't call method "\Q$method\E" on)/;
+                return;
+            }
+        }
+    }
 }
 
-my $json = JSON->new->allow_nonref;
+# FIXME can't have expressions in params/subscripts yet, because you can't
+# extend this with new word types
+# gotta write a subclassible parser =(
+my $json = JSON->new->allow_nonref->relaxed;
+
 my $delim = qr/\./;
 my $ident = qr/[A-Za-z_]\w*/;
 my $open_params = qr{\(};
@@ -100,15 +134,13 @@ sub _parse_path {
 
         # parse a subscript action, either an ident or an open bracket
         if ( $path =~ /\G($ident)/g ) {
-            push @ret, $1;
+            my $name = $1;
 
             $p = pos($path);
 
             # followed by a subscript or arguments
             if ( $path =~ /\G$open_params/g ) {
                 $p = pos($path);
-
-                my $method = pop @ret;
 
                 my @args;
 
@@ -120,8 +152,9 @@ sub _parse_path {
                     }
                 }
 
-                push @ret, $self->_compile_method($method, @args);
+                push @ret, $self->_compile_method($name, @args);
             } else {
+                push @ret, \$name;
                 pos($path) = $p;
             }
         } else {
