@@ -14,6 +14,12 @@ has unknown_method_is_fatal => (
     default => 1,
 );
 
+has "compile_method" => (
+    isa => "Str|CodeRef",
+    is  => "ro",
+    default => "default_compile_method",
+);
+
 has cache => (
     isa => "Bool",
     is  => "ro",
@@ -89,8 +95,16 @@ use Moose::Autobox;
 sub _compile_method {
     my ( $self, %args ) = @_;
 
+    my $hook = $self->compile_method;
+
     my $method = $args{method};
     my @args = @{ $args{args} || [] };
+
+    $self->$hook($method, @args);
+}
+
+sub default_compile_method {
+    my ( $self, $method, @args ) = @_;
 
     return sub {
         $_[0]->$method(@args);
