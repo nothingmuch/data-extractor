@@ -1,0 +1,27 @@
+About
+=====
+
+This module implements something similar to `Template::Stash`'s `get` method,
+based on `Moose::Autobox`:
+
+	$d->extract(
+		{
+			foo => [
+				Person->new(
+					info => {
+						name => "blah",
+					}
+				),
+			],
+		},
+		"foo[0].info.name.length", # returns 4 (length "blah")
+	);
+
+For more XPath like data traversal see `Data::Path`, `Data::XPath`, and
+`Data::DPath`.
+
+TODO
+====
+
+* When using JSON to parse argument lists or subscripts, allow nested expressions
+* When nested expressions are supported, the root argument is needed
